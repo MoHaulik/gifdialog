@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Dialog System</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; background: #f0f2f5; }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; }
+    #start-button { padding: 15px 28px; font-size: 18px; background: #4876FF; color: white; border: none; border-radius: 12px; box-shadow: 0 4px 14px rgba(72,118,255,0.4); cursor: pointer; transition: all 0.2s; font-weight: 600; }
+    #start-button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(72,118,255,0.5); }
+    #status { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.7); color: white; padding: 12px 24px; border-radius: 12px; font-size: 16px; font-weight: 500; margin: 0; backdrop-filter: blur(8px); box-shadow: 0 4px 12px rgba(0,0,0,0.2); max-width: 80%; text-align: center; display: none; z-index: 1000; }
+    .exit-ar { position: fixed; top: 20px; right: 20px; background: rgba(0,0,0,0.5); color: white; border: none; border-radius: 50%; width: 46px; height: 46px; display: none; align-items: center; justify-content: center; font-size: 24px; cursor: pointer; backdrop-filter: blur(8px); box-shadow: 0 2px 10px rgba(0,0,0,0.3); z-index: 1000; }
+    .xr-active .exit-ar { display: flex; }
+  </style>
+</head>
+<body>
+  <div id="overlay"><button id="start-button">Start Dialog Demo</button></div>
+  <button class="exit-ar" id="exit-ar">×</button>
+  <div id="status"></div>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    // Main variables
+    let camera, scene, renderer, controllers = [], xrSession = null, raycaster, tempMatrix, dialogSystem;
+    
+    // Initialize WebXR components
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      renderer.shadowMap.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      // Lighting
+      scene.add(new THREE.AmbientLight(0x404040, 2));
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+      directionalLight.position.set(1, 1, 1).normalize();
+      directionalLight.castShadow = true;
+      scene.add(directionalLight);
+      
+      // Setup for interaction
+      raycaster = new THREE.Raycaster();
+      tempMatrix = new THREE.Matrix4();
+      dialogSystem = new DialogSystem();
+      
+      // Event listeners
+      window.addEventListener('resize', onWindowResize);
+      document.getElementById('start-button').addEventListener('click', startARSession);
+      document.getElementById('exit-ar').addEventListener('click', endARSession);
+    }
+
+    // Start AR session
+    function startARSession() {
+      if (!navigator.xr) {
+        updateStatus('WebXR not supported in this browser.');
+        return;
+      }
+      
+      navigator.xr.isSessionSupported('immersive-ar')
+        .then(supported => {
+          if (supported) {
+            navigator.xr.requestSession('immersive-ar', { 
+              requiredFeatures: ['hit-test'],
+              optionalFeatures: ['dom-overlay', 'hand-tracking'], 
+              domOverlay: { root: document.body } 
+            })
+            .then(onSessionStarted)
+            .catch(err => updateStatus('Failed to start AR: ' + err.message));
+          } else {
+            updateStatus('WebXR AR not supported on this device.');
+          }
+        });
+    }
+
+    // Handle AR session start
+    function onSessionStarted(session) {
+      xrSession = session;
+      document.getElementById('start-button').style.display = 'none';
+      document.body.classList.add('xr-active');
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      // Setup controllers
+      controllers = [0, 1].map(i => {
+        const controller = renderer.xr.getController(i);
+        controller.userData.id = i;
+        controller.userData.isSelecting = false;
+        
+        // Visual indicator
+        const handMesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.02, 16, 16),
+          new THREE.MeshStandardMaterial({
+            color: i === 0 ? 0x4876FF : 0xFF4848,
+            roughness: 0.3,
+            metalness: 0.5,
+            transparent: true,
+            opacity: 0.7
+          })
+        );
+        controller.add(handMesh);
+        
+        controller.addEventListener('selectstart', onControllerSelectStart);
+        controller.addEventListener('selectend', onControllerSelectEnd);
+        scene.add(controller);
+        return controller;
+      });
+      
+      // Initialize dialog system
+      dialogSystem.init(scene, camera);
+      setTimeout(() => dialogSystem.startDialogSequence(), 1500);
+      
+      renderer.setAnimationLoop(render);
+      session.addEventListener('end', onSessionEnd);
+      updateStatus('Dialog system ready! Tap the next button to advance.');
+    }
+    
+    // End AR session
+    function endARSession() {
+      if (xrSession) xrSession.end();
+    }
+    
+    function onSessionEnd() {
+      document.body.classList.remove('xr-active');
+      document.getElementById('start-button').style.display = 'block';
+      document.getElementById('status').style.display = 'none';
+      controllers = [];
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+      
+      // Clean up scene
+      while(scene.children.length > 0) { 
+        const object = scene.children[0];
+        if (object.geometry) object.geometry.dispose();
+        if (object.material) {
+          if (Array.isArray(object.material)) {
+            object.material.forEach(m => m.dispose());
+          } else {
+            object.material.dispose();
+          }
+        }
+        scene.remove(object); 
+      }
+    }
+    
+    function onControllerSelectStart(event) {
+      const controller = event.target;
+      controller.userData.isSelecting = true;
+      
+      // Raycasting for interaction
+      tempMatrix.identity().extractRotation(controller.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+      
+      const interactiveObjects = dialogSystem.getInteractiveObjects();
+      const intersects = raycaster.intersectObjects(interactiveObjects, true);
+      
+      if (intersects.length > 0) {
+        // Find interactive parent
+        let current = intersects[0].object;
+        while (current) {
+          if (current.userData && current.userData.onClick) {
+            current.userData.onClick();
+            break;
+          }
+          current = current.parent;
+        }
+      }
+    }
+    
+    function onControllerSelectEnd(event) {
+      event.target.userData.isSelecting = false;
+    }
+    
+    function render() {
+      // Update dialog system
+      if (dialogSystem) dialogSystem.update(camera);
+      
+      // Check controller interaction
+      controllers.forEach(controller => {
+        if (controller.userData.isSelecting) {
+          tempMatrix.identity().extractRotation(controller.matrixWorld);
+          raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+          raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+          
+          const interactiveObjects = dialogSystem.getInteractiveObjects();
+          const intersects = raycaster.intersectObjects(interactiveObjects, true);
+          
+          if (intersects.length > 0) {
+            // Visual feedback on hover
+            const object = intersects[0].object;
+            if (object.material && !object.userData.isHovered) {
+              object.userData.originalColor = object.material.color.clone();
+              object.material.color.multiplyScalar(1.2);
+              object.userData.isHovered = true;
+            }
+          }
+        }
+      });
+      
+      renderer.render(scene, camera);
+    }
+    
+    function onWindowResize() {
+      if (camera) {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.textContent = message;
+      statusElement.style.display = 'block';
+      
+      // Auto-hide after 4 seconds for non-error messages
+      if (!message.includes('error') && !message.includes('not supported')) {
+        setTimeout(() => { statusElement.style.display = 'none'; }, 4000);
+      }
+    }
+    
+    // Dialog System Class - Optimized for GIFs
+    class DialogSystem {
+      constructor() {
+        this.dialogPanel = null;
+        this.currentDialogIndex = 0;
+        this.isActive = false;
+        this.nextButton = null;
+        this.portraitMesh = null;
+        this.textElement = null;
+        this.nameElement = null;
+        this.dialogGroup = null;
+        
+        // Dialog content
+        this.dialogSequence = [
+          { speaker: "Hero", message: "I've finally found you! Your reign of terror ends today!", color: "#4876FF" },
+          { speaker: "Enemy", message: "Ah, the so-called hero arrives. Do you really think you can defeat me?", color: "#FF4848" },
+          { speaker: "Hero", message: "I've trained my whole life for this moment. I won't fail!", color: "#4876FF" },
+          { speaker: "Enemy", message: "Such confidence! Let's see if you can back it up with skill.", color: "#FF4848" },
+          { speaker: "Hero", message: "Enough talk. Prepare yourself!", color: "#4876FF" }
+        ];
+        
+        // Load GIF textures
+        this.loadGIFTextures();
+      }
+      
+      // New method to load GIF textures
+      loadGIFTextures() {
+        // Create a video element for hero.gif
+        this.heroVideo = document.createElement('video');
+        this.heroVideo.src = 'hero.gif';
+        this.heroVideo.loop = true;
+        this.heroVideo.muted = true;
+        this.heroVideo.playsInline = true;
+        this.heroVideo.autoplay = true;
+        this.heroVideo.style.display = 'none';
+        document.body.appendChild(this.heroVideo);
+        
+        // Create video texture for hero
+        this.heroTexture = new THREE.VideoTexture(this.heroVideo);
+        this.heroTexture.minFilter = THREE.LinearFilter;
+        this.heroTexture.magFilter = THREE.LinearFilter;
+        this.heroTexture.format = THREE.RGBAFormat;
+        
+        // Create a video element for deer.gif (enemy)
+        this.enemyVideo = document.createElement('video');
+        this.enemyVideo.src = 'deer.gif';
+        this.enemyVideo.loop = true;
+        this.enemyVideo.muted = true;
+        this.enemyVideo.playsInline = true;
+        this.enemyVideo.autoplay = true;
+        this.enemyVideo.style.display = 'none';
+        document.body.appendChild(this.enemyVideo);
+        
+        // Create video texture for enemy
+        this.enemyTexture = new THREE.VideoTexture(this.enemyVideo);
+        this.enemyTexture.minFilter = THREE.LinearFilter;
+        this.enemyTexture.magFilter = THREE.LinearFilter;
+        this.enemyTexture.format = THREE.RGBAFormat;
+        
+        // Start playing videos
+        this.heroVideo.play().catch(e => console.error("Error playing hero video:", e));
+        this.enemyVideo.play().catch(e => console.error("Error playing enemy video:", e));
+      }
+      
+      init(scene, camera) {
+        this.scene = scene;
+        this.camera = camera;
+        
+        // Create dialog group
+        this.dialogGroup = new THREE.Group();
+        this.dialogGroup.position.set(0, 0, -0.6);
+        this.scene.add(this.dialogGroup);
+        
+        // Create dialog panel
+        this.createDialogPanel();
+      }
+      
+      createDialogPanel() {
+        // Main panel
+        const panel = new THREE.Group();
+        const panelWidth = 0.6;
+        const panelHeight = 0.3;
+        
+        // Create background, portrait, text and button
+        this.createPanelBackground(panel, panelWidth, panelHeight);
+        this.createPortraitAndName(panel, panelWidth, panelHeight);
+        this.createTextElement(panel, panelWidth, panelHeight);
+        this.createNextButton(panel, panelWidth, panelHeight);
+        
+        // Add to dialog group
+        this.dialogGroup.add(panel);
+        this.dialogPanel = panel;
+        this.dialogPanel.visible = false;
+      }
+      
+      createPanelBackground(panel, width, height) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+        
+        // Draw rounded rectangle
+        const cornerRadius = 32;
+        ctx.fillStyle = 'rgba(10, 12, 16, 0.85)';
+        ctx.beginPath();
+        ctx.moveTo(cornerRadius, 0);
+        ctx.lineTo(canvas.width - cornerRadius, 0);
+        ctx.quadraticCurveTo(canvas.width, 0, canvas.width, cornerRadius);
+        ctx.lineTo(canvas.width, canvas.height - cornerRadius);
+        ctx.quadraticCurveTo(canvas.width, canvas.height, canvas.width - cornerRadius, canvas.height);
+        ctx.lineTo(cornerRadius, canvas.height);
+        ctx.quadraticCurveTo(0, canvas.height, 0, canvas.height - cornerRadius);
+        ctx.lineTo(0, cornerRadius);
+        ctx.quadraticCurveTo(0, 0, cornerRadius, 0);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Add subtle border
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        const texture = new THREE.CanvasTexture(canvas);
+        const material = new THREE.MeshBasicMaterial({
+          map: texture,
+          transparent: true,
+          side: THREE.DoubleSide
+        });
+        
+        panel.add(new THREE.Mesh(
+          new THREE.PlaneGeometry(width, height),
+          material
+        ));
+      }
+      
+      createPortraitAndName(panel, panelWidth, panelHeight) {
+        // Portrait setup - using 16:9 aspect ratio
+        const portraitWidth = 0.15;
+        const portraitHeight = portraitWidth * (9/16); // 16:9 aspect ratio
+        
+        // Portrait mesh with 16:9 aspect ratio
+        this.portraitMesh = new THREE.Mesh(
+          new THREE.PlaneGeometry(portraitWidth, portraitHeight),
+          new THREE.MeshBasicMaterial({
+            map: this.heroTexture,
+            transparent: true
+          })
+        );
+        this.portraitMesh.position.set(-(panelWidth/2) + portraitWidth/2 + 0.025, 0.04, 0.001);
+        panel.add(this.portraitMesh);
+        
+        // Name element
+        const nameCanvas = document.createElement('canvas');
+        nameCanvas.width = 256;
+        nameCanvas.height = 64;
+        const nameCtx = nameCanvas.getContext('2d');
+        
+        // Draw initial name
+        this.drawName(nameCtx, "Hero", "#4876FF", nameCanvas.width, nameCanvas.height);
+        
+        const nameTexture = new THREE.CanvasTexture(nameCanvas);
+        this.nameElement = new THREE.Mesh(
+          new THREE.PlaneGeometry(portraitWidth, 0.04),
+          new THREE.MeshBasicMaterial({
+            map: nameTexture, 
+            transparent: true,
+            side: THREE.DoubleSide
+          })
+        );
+        this.nameElement.position.set(-(panelWidth/2) + portraitWidth/2 + 0.025, -(portraitHeight/2) - 0.01, 0.001);
+        
+        // Update function for name
+        this.nameElement.userData.updateName = (name, color) => {
+          this.drawName(nameCtx, name, color, nameCanvas.width, nameCanvas.height);
+          nameTexture.needsUpdate = true;
+        };
+        
+        panel.add(this.nameElement);
+      }
+      
+      drawName(ctx, name, color, width, height) {
+        // Clear canvas
+        ctx.clearRect(0, 0, width, height);
+        
+        // Draw rounded rectangle background
+        const cornerRadius = 12;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(cornerRadius, 0);
+        ctx.lineTo(width - cornerRadius, 0);
+        ctx.quadraticCurveTo(width, 0, width, cornerRadius);
+        ctx.lineTo(width, height - cornerRadius);
+        ctx.quadraticCurveTo(width, height, width - cornerRadius, height);
+        ctx.lineTo(cornerRadius, height);
+        ctx.quadraticCurveTo(0, height, 0, height - cornerRadius);
+        ctx.lineTo(0, cornerRadius);
+        ctx.quadraticCurveTo(0, 0, cornerRadius, 0);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Add text
+        ctx.font = 'bold 32px sans-serif';
+        ctx.fillStyle = 'white';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(name, width / 2, height / 2);
+      }
+      
+      createTextElement(panel, panelWidth, panelHeight) {
+        // Create text canvas - fixed the text placement issue
+        const textCanvas = document.createElement('canvas');
+        textCanvas.width = 640;
+        textCanvas.height = 256;
+        const textCtx = textCanvas.getContext('2d');
+        
+        // Initial drawing
+        this.drawText(textCtx, "Dialog text will appear here...", textCanvas.width, textCanvas.height);
+        
+        const textTexture = new THREE.CanvasTexture(textCanvas);
+        this.textElement = new THREE.Mesh(
+          new THREE.PlaneGeometry(0.4, 0.2),
+          new THREE.MeshBasicMaterial({
+            map: textTexture,
+            transparent: true,
+            side: THREE.DoubleSide
+          })
+        );
+        
+        // Fixed position to not overlap with portrait
+        this.textElement.position.set(0.08, 0.04, 0.001); // Moved further to the right
+        
+        this.textElement.userData.updateText = (text) => {
+          this.drawText(textCtx, text, textCanvas.width, textCanvas.height);
+          textTexture.needsUpdate = true;
+        };
+        
+        panel.add(this.textElement);
+      }
+      
+      drawText(ctx, text, width, height) {
+        // Clear canvas
+        ctx.clearRect(0, 0, width, height);
+        
+        // Set text style
+        ctx.font = '24px sans-serif';
+        ctx.fillStyle = 'white';
+        ctx.textBaseline = 'top';
+        
+        // Word wrap
+        const words = text.split(' ');
+        const maxWidth = width - 20;
+        let line = '';
+        let lineY = 20;
+        const lineHeight = 32;
+        
+        for (let i = 0; i < words.length; i++) {
+          const testLine = line + words[i] + ' ';
+          const metrics = ctx.measureText(testLine);
+          
+          if (metrics.width > maxWidth && i > 0) {
+            ctx.fillText(line, 10, lineY);
+            line = words[i] + ' ';
+            lineY += lineHeight;
+          } else {
+            line = testLine;
+          }
+        }
+        
+        ctx.fillText(line, 10, lineY);
+      }
+      
+      createNextButton(panel, panelWidth, panelHeight) {
+        // Create button canvas
+        const buttonCanvas = document.createElement('canvas');
+        buttonCanvas.width = 128;
+        buttonCanvas.height = 128;
+        const buttonCtx = buttonCanvas.getContext('2d');
+        
+        // Draw initial button
+        this.drawButton(buttonCtx, false, buttonCanvas.width, buttonCanvas.height);
+        
+        const buttonTexture = new THREE.CanvasTexture(buttonCanvas);
+        const buttonMaterial = new THREE.MeshBasicMaterial({
+          map: buttonTexture,
+          transparent: true,
+          side: THREE.DoubleSide
+        });
+        
+        this.nextButton = new THREE.Mesh(
+          new THREE.PlaneGeometry(0.05, 0.05),
+          buttonMaterial
+        );
+        this.nextButton.position.set((panelWidth/2) - 0.05, -(panelHeight/2) + 0.05, 0.001);
+        
+        // Interactive behavior
+        this.nextButton.userData.onClick = () => {
+          this.showNextDialog();
+          
+          // Visual feedback with fixed shadow
+          buttonCtx.shadowBlur = 0; // Reset shadow before redrawing
+          buttonCtx.shadowColor = 'transparent';
+          
+          this.drawButton(buttonCtx, true, buttonCanvas.width, buttonCanvas.height);
+          buttonTexture.needsUpdate = true;
+          
+          setTimeout(() => {
+            buttonCtx.shadowBlur = 0; // Reset shadow before redrawing
+            buttonCtx.shadowColor = 'transparent';
+            
+            this.drawButton(buttonCtx, false, buttonCanvas.width, buttonCanvas.height);
+            buttonTexture.needsUpdate = true;
+          }, 200);
+        };
+        
+        panel.add(this.nextButton);
+      }
+      
+      drawButton(ctx, hover, width, height) {
+        // Clear the canvas completely
+        ctx.clearRect(0, 0, width, height);
+        
+        // Reset any previous shadow settings
+        ctx.shadowBlur = 0;
+        ctx.shadowColor = 'transparent';
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 0;
+        
+        // Draw circle with solid color (no shadow)
+        ctx.beginPath();
+        ctx.arc(width/2, height/2, width/2.56, 0, 2 * Math.PI);
+        ctx.fillStyle = hover ? '#5993FF' : '#4876FF';
+        ctx.fill();
+        
+        // Draw arrow (no shadow)
+        ctx.beginPath();
+        ctx.moveTo(width*0.39, height*0.34);
+        ctx.lineTo(width*0.625, height*0.5);
+        ctx.lineTo(width*0.39, height*0.66);
+        ctx.fillStyle = 'white';
+        ctx.fill();
+        
+        // Optional: Add a stroke instead of shadow for better visibility
+        ctx.beginPath();
+        ctx.arc(width/2, height/2, width/2.56, 0, 2 * Math.PI);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      
+      startDialogSequence() {
+        this.isActive = true;
+        this.currentDialogIndex = 0;
+        this.dialogPanel.visible = true;
+        this.showCurrentDialog();
+      }
+      
+      showCurrentDialog() {
+        if (this.currentDialogIndex >= this.dialogSequence.length) {
+          this.endDialogSequence();
+          return;
+        }
+        
+        const dialog = this.dialogSequence[this.currentDialogIndex];
+        
+        // Update portrait texture based on speaker
+        if (dialog.speaker === "Hero") {
+          this.portraitMesh.material.map = this.heroTexture;
+          // Ensure hero video is playing
+          if (this.heroVideo.paused) this.heroVideo.play().catch(e => console.log("Error playing hero video:", e));
+        } else {
+          this.portraitMesh.material.map = this.enemyTexture;
+          // Ensure enemy video is playing
+          if (this.enemyVideo.paused) this.enemyVideo.play().catch(e => console.log("Error playing enemy video:", e));
+        }
+        
+        this.portraitMesh.material.needsUpdate = true;
+        
+        // Update name and text
+        this.nameElement.userData.updateName(dialog.speaker, dialog.color);
+        this.textElement.userData.updateText(dialog.message);
+      }
+      
+      showNextDialog() {
+        this.currentDialogIndex++;
+        if (this.currentDialogIndex >= this.dialogSequence.length) {
+          this.endDialogSequence();
+          return;
+        }
+        this.showCurrentDialog();
+      }
+      
+      endDialogSequence() {
+        this.isActive = false;
+        this.dialogPanel.visible = false;
+        updateStatus("Dialog complete! Starting over in 3 seconds...");
+        
+        // Restart after delay
+        setTimeout(() => this.startDialogSequence(), 3000);
+      }
+      
+      update(camera) {
+        if (!this.isActive || !this.dialogGroup || !camera) return;
+        
+        // Position dialog in front of camera
+        const cameraDirection = new THREE.Vector3(0, 0, -1);
+        cameraDirection.applyQuaternion(camera.quaternion);
+        cameraDirection.multiplyScalar(0.7); // Distance from camera
+        
+        this.dialogGroup.position.copy(camera.position).add(cameraDirection);
+        this.dialogGroup.lookAt(camera.position);
+        
+        // Adjust vertical position - slightly below eye level
+        this.dialogGroup.position.y = camera.position.y - 0.1;
+      }
+      
+      getInteractiveObjects() {
+        return [this.nextButton];
+      }
+    }
+    
+    // Initialize everything
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
